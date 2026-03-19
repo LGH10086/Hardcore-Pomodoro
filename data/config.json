@@ -1,0 +1,27 @@
+{
+  "timing": {
+    "work_duration_minutes": 1,
+    "break_duration_minutes": 1,
+    "focus_rounds": 1
+  },
+  "ui_customization": {
+    "background_image_path": "C:/Users/LGH10086/Desktop/80638362_p0_master1200.jpg",
+    "motto": "Stay focused, stay foolish."
+  },
+  "process_whitelist": [
+    "chrome.exe",
+    "code.exe",
+    "edge.exe",
+    "pycharm64.exe",
+    "python.exe",
+    "pythonw.exe"
+  ],
+  "network_blacklist": [
+    {
+      "domain": "bilibili.com",
+      "start_time": "08:00",
+      "end_time": "11:30",
+      "is_active": true
+    }
+  ]
+}

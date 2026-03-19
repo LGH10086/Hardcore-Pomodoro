@@ -1,0 +1,664 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+from PySide6.QtCore import QEasingCurve, QPropertyAnimation, Slot
+from PySide6.QtGui import QGuiApplication
+from PySide6.QtWidgets import (
+    QFileDialog,
+    QFrame,
+    QGraphicsOpacityEffect,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QSpinBox,
+    QStackedWidget,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
+
+from core.config_manager import ConfigManager
+from core.scheduler import SchedulerService
+from core.state_machine import PomodoroState, StateMachine
+from core.timer import PomodoroTimer
+from core.watchdog import WatchdogService
+from os_services.base import IProcessMonitor
+from ui.overlay_window import OverlayWindow
+
+
+class MainWindow(QMainWindow):
+    def __init__(
+        self,
+        config_manager: ConfigManager,
+        state_machine: StateMachine,
+        timer: PomodoroTimer,
+        watchdog: WatchdogService,
+        scheduler: SchedulerService,
+        process_monitor: IProcessMonitor,
+        is_admin: bool,
+    ) -> None:
+        super().__init__()
+        self._config_manager = config_manager
+        self._state_machine = state_machine
+        self._timer = timer
+        self._watchdog = watchdog
+        self._scheduler = scheduler
+        self._process_monitor = process_monitor
+        self._is_admin = is_admin
+        self._overlays: list[OverlayWindow] = []
+        self._target_focus_rounds = 1
+        self._current_focus_round = 0
+        self._section_sidebar: QListWidget
+        self._section_stack: QStackedWidget
+        self._section_transition: QPropertyAnimation | None = None
+
+        self.setWindowTitle("Hardcore Pomodoro")
+        self.resize(1160, 780)
+
+        self._build_ui()
+        self._connect_signals()
+        self._load_config_into_form()
+        self._build_overlay_windows()
+
+        self._scheduler.start()
+        if not self._is_admin:
+            QMessageBox.warning(self, "权限提醒", "当前未以管理员权限运行，网络阻断功能不可用。")
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        self._timer.stop()
+        self._watchdog.stop()
+        self._scheduler.stop()
+        self._hide_overlays()
+        super().closeEvent(event)
+
+    def _build_ui(self) -> None:
+        root = QWidget(self)
+        self.setCentralWidget(root)
+
+        self._status_label = QLabel("状态: INIT")
+        self._countdown_label = QLabel("剩余: 00:00")
+        self._round_label = QLabel("轮次: 0/0")
+        self._admin_label = QLabel("管理员权限: 已开启" if self._is_admin else "管理员权限: 未开启")
+
+        self._work_spin = QSpinBox()
+        self._work_spin.setRange(1, 240)
+        self._break_spin = QSpinBox()
+        self._break_spin.setRange(1, 120)
+        self._rounds_spin = QSpinBox()
+        self._rounds_spin.setRange(1, 20)
+
+        self._bg_path_edit = QLineEdit()
+        self._motto_edit = QLineEdit()
+
+        self._whitelist_edit = QTextEdit()
+        self._whitelist_edit.setPlaceholderText("每行一个进程名，例如 code.exe")
+
+        self._network_rules_edit = QTextEdit()
+        self._network_rules_edit.setPlaceholderText("每行格式: domain,start,end,active(1或0)")
+
+        shell_layout = QHBoxLayout(root)
+        shell_layout.setContentsMargins(18, 18, 18, 18)
+        shell_layout.setSpacing(16)
+
+        self._section_sidebar = QListWidget()
+        self._section_sidebar.setObjectName("sidebar")
+        self._section_sidebar.setFixedWidth(200)
+        for title in ("专注", "锁屏个性化", "黑白名单管理", "运行日志"):
+            self._section_sidebar.addItem(QListWidgetItem(title))
+        self._section_sidebar.setCurrentRow(0)
+        self._section_sidebar.currentRowChanged.connect(self._on_section_changed)
+
+        content_wrap = QWidget()
+        content_layout = QVBoxLayout(content_wrap)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(14)
+
+        title_wrap = QFrame()
+        title_wrap.setObjectName("titleWrap")
+        title_layout = QVBoxLayout(title_wrap)
+        title_layout.setContentsMargins(12, 10, 12, 10)
+        app_title = QLabel("Hardcore Pomodoro")
+        app_title.setObjectName("appTitle")
+        app_subtitle = QLabel("Focus Without Escape | 选择左侧栏目，打造你的专注系统")
+        app_subtitle.setObjectName("appSubtitle")
+        title_layout.addWidget(app_title)
+        title_layout.addWidget(app_subtitle)
+        content_layout.addWidget(title_wrap)
+
+        stats_bar = self._build_stats_bar()
+        content_layout.addWidget(stats_bar)
+
+        self._section_stack = QStackedWidget()
+        self._section_stack.addWidget(self._build_focus_page())
+        self._section_stack.addWidget(self._build_personalization_page())
+        self._section_stack.addWidget(self._build_lists_page())
+        self._section_stack.addWidget(self._build_log_page())
+        content_layout.addWidget(self._section_stack)
+
+        shell_layout.addWidget(self._section_sidebar)
+        shell_layout.addWidget(content_wrap, 1)
+
+        self._apply_theme()
+
+    def _build_stats_bar(self) -> QWidget:
+        panel = QFrame()
+        panel.setObjectName("statsPanel")
+        layout = QHBoxLayout(panel)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(10)
+        layout.addWidget(self._create_stat_card("当前状态", self._status_label))
+        layout.addWidget(self._create_stat_card("倒计时", self._countdown_label))
+        layout.addWidget(self._create_stat_card("轮次", self._round_label))
+        layout.addWidget(self._create_stat_card("权限", self._admin_label))
+        return panel
+
+    def _create_stat_card(self, title: str, value_label: QLabel) -> QWidget:
+        card = QFrame()
+        card.setObjectName("statCard")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(12, 10, 12, 10)
+        caption = QLabel(title)
+        caption.setObjectName("statTitle")
+        value_label.setObjectName("statValue")
+        layout.addWidget(caption)
+        layout.addWidget(value_label)
+        return card
+
+    def _build_focus_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+
+        intro = QLabel("在这里设置番茄时长与轮次，开始一轮硬核专注。")
+        intro.setObjectName("sectionIntro")
+        layout.addWidget(intro)
+
+        timing_box = QGroupBox("专注参数")
+        grid = QGridLayout()
+        grid.addWidget(QLabel("专注时长(分钟)"), 0, 0)
+        grid.addWidget(self._work_spin, 0, 1)
+        grid.addWidget(QLabel("休息时长(分钟)"), 1, 0)
+        grid.addWidget(self._break_spin, 1, 1)
+        grid.addWidget(QLabel("专注轮数"), 2, 0)
+        grid.addWidget(self._rounds_spin, 2, 1)
+        timing_box.setLayout(grid)
+        layout.addWidget(timing_box)
+
+        action_bar = QHBoxLayout()
+        start_btn = QPushButton("开始专注")
+        start_btn.setObjectName("btnPrimary")
+        start_btn.clicked.connect(self._on_start_focus)
+        stop_btn = QPushButton("停止并重置")
+        stop_btn.setObjectName("btnWarn")
+        stop_btn.clicked.connect(self._on_stop)
+        save_btn = QPushButton("保存当前设置")
+        save_btn.clicked.connect(self._save_form_to_config)
+        action_bar.addWidget(start_btn)
+        action_bar.addWidget(stop_btn)
+        action_bar.addWidget(save_btn)
+        action_bar.addStretch(1)
+
+        action_host = QFrame()
+        action_host.setObjectName("actionHost")
+        action_host.setLayout(action_bar)
+        layout.addWidget(action_host)
+        layout.addStretch(1)
+        return page
+
+    def _build_personalization_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+
+        intro = QLabel("自定义锁屏背景和标语，打造你的专注仪式感。")
+        intro.setObjectName("sectionIntro")
+        layout.addWidget(intro)
+
+        box = QGroupBox("锁屏个性化")
+        grid = QGridLayout()
+        grid.addWidget(QLabel("背景图片路径"), 0, 0)
+        grid.addWidget(self._bg_path_edit, 0, 1)
+        browse_btn = QPushButton("选择图片")
+        browse_btn.clicked.connect(self._on_pick_image)
+        grid.addWidget(browse_btn, 0, 2)
+        grid.addWidget(QLabel("励志标语"), 1, 0)
+        grid.addWidget(self._motto_edit, 1, 1, 1, 2)
+        box.setLayout(grid)
+        layout.addWidget(box)
+
+        save_btn = QPushButton("保存并应用锁屏样式")
+        save_btn.setObjectName("btnPrimary")
+        save_btn.clicked.connect(self._save_form_to_config)
+        layout.addWidget(save_btn)
+        layout.addStretch(1)
+        return page
+
+    def _build_lists_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+
+        intro = QLabel("维护允许切换的进程与定时网络黑名单规则。")
+        intro.setObjectName("sectionIntro")
+        layout.addWidget(intro)
+
+        whitelist_box = QGroupBox("进程白名单")
+        wl = QVBoxLayout(whitelist_box)
+        wl.addWidget(self._whitelist_edit)
+
+        network_box = QGroupBox("网络黑名单计划")
+        nl = QVBoxLayout(network_box)
+        nl.addWidget(self._network_rules_edit)
+
+        layout.addWidget(whitelist_box)
+        layout.addWidget(network_box)
+
+        save_btn = QPushButton("保存黑白名单")
+        save_btn.clicked.connect(self._save_form_to_config)
+        layout.addWidget(save_btn)
+        return page
+
+    def _build_log_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+
+        intro = QLabel("查看运行状态、违规检测、网络调度事件。")
+        intro.setObjectName("sectionIntro")
+        layout.addWidget(intro)
+
+        self._log_edit = QTextEdit()
+        self._log_edit.setReadOnly(True)
+        self._log_edit.setPlaceholderText("日志会实时显示在这里...")
+        layout.addWidget(self._log_edit)
+
+        clear_btn = QPushButton("清空日志")
+        clear_btn.clicked.connect(self._log_edit.clear)
+        layout.addWidget(clear_btn)
+        return page
+
+    def _apply_theme(self) -> None:
+        self.setStyleSheet(
+            """
+            QMainWindow, QWidget {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                    stop:0 #121212, stop:0.45 #201a14, stop:1 #111827);
+                color: #f3f4f6;
+                font-size: 13px;
+            }
+            QLabel {
+                color: #f3f4f6;
+            }
+            QFrame#titleWrap {
+                border: 1px solid rgba(251, 191, 36, 0.28);
+                border-radius: 14px;
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                    stop:0 rgba(20, 20, 20, 0.78), stop:1 rgba(30, 41, 59, 0.64));
+            }
+            QLabel#appTitle {
+                font-size: 28px;
+                font-family: "Bahnschrift", "Microsoft YaHei UI";
+                font-weight: 700;
+                letter-spacing: 0.8px;
+                color: #fef3c7;
+            }
+            QLabel#appSubtitle {
+                font-size: 13px;
+                font-family: "Segoe UI", "Microsoft YaHei UI";
+                color: #fdba74;
+                font-weight: 500;
+            }
+            QListWidget#sidebar {
+                border: 1px solid rgba(250, 204, 21, 0.34);
+                border-radius: 14px;
+                background: rgba(10, 10, 10, 0.7);
+                padding: 8px;
+                outline: none;
+            }
+            QListWidget#sidebar::item {
+                padding: 12px 10px;
+                margin: 4px 0;
+                border-radius: 10px;
+                color: #fde68a;
+                font-size: 15px;
+                font-weight: 700;
+                font-family: "Bahnschrift", "Microsoft YaHei UI";
+            }
+            QListWidget#sidebar::item:selected {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 rgba(245, 158, 11, 0.92), stop:1 rgba(249, 115, 22, 0.92));
+                color: #111827;
+            }
+            QFrame#statsPanel {
+                border: 1px solid rgba(125, 211, 252, 0.32);
+                border-radius: 14px;
+                background: rgba(2, 6, 23, 0.6);
+            }
+            QFrame#statCard {
+                border: 1px solid rgba(148, 163, 184, 0.32);
+                border-radius: 10px;
+                background: rgba(15, 23, 42, 0.68);
+                min-height: 62px;
+            }
+            QLabel#statTitle {
+                color: #93c5fd;
+                font-size: 11px;
+                font-family: "Segoe UI", "Microsoft YaHei UI";
+            }
+            QLabel#statValue {
+                color: #f9fafb;
+                font-size: 17px;
+                font-weight: 700;
+                font-family: "Bahnschrift", "Microsoft YaHei UI";
+            }
+            QLabel#sectionIntro {
+                color: #fdba74;
+                font-size: 15px;
+                font-weight: 600;
+                font-family: "Segoe UI", "Microsoft YaHei UI";
+            }
+            QGroupBox {
+                border: 1px solid rgba(148, 163, 184, 0.35);
+                border-radius: 12px;
+                margin-top: 12px;
+                padding: 10px;
+                background: rgba(15, 23, 42, 0.55);
+                font-weight: 600;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 6px;
+                color: #fcd34d;
+            }
+            QLineEdit, QTextEdit, QSpinBox {
+                border: 1px solid rgba(148, 163, 184, 0.45);
+                border-radius: 8px;
+                background: rgba(15, 23, 42, 0.72);
+                color: #f3f4f6;
+                padding: 6px;
+                selection-background-color: #0ea5e9;
+            }
+            QPushButton {
+                border: 1px solid rgba(251, 191, 36, 0.55);
+                border-radius: 10px;
+                padding: 8px 14px;
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #0ea5e9, stop:1 #f59e0b);
+                color: #111827;
+                font-weight: 600;
+            }
+            QPushButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #22d3ee, stop:1 #fbbf24);
+            }
+            QPushButton:pressed {
+                background: #f59e0b;
+            }
+            QPushButton#btnPrimary {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #10b981, stop:1 #22d3ee);
+            }
+            QPushButton#btnWarn {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #ef4444, stop:1 #f97316);
+                color: #fff7ed;
+            }
+            QFrame#actionHost {
+                border: 1px solid rgba(56, 189, 248, 0.3);
+                border-radius: 12px;
+                background: rgba(2, 6, 23, 0.55);
+            }
+            """
+        )
+
+    @Slot(int)
+    def _on_section_changed(self, index: int) -> None:
+        safe_index = max(0, index)
+        if safe_index == self._section_stack.currentIndex():
+            return
+
+        self._section_stack.setCurrentIndex(safe_index)
+        target_page = self._section_stack.currentWidget()
+        if target_page is None:
+            return
+
+        effect = QGraphicsOpacityEffect(target_page)
+        target_page.setGraphicsEffect(effect)
+
+        animation = QPropertyAnimation(effect, b"opacity", self)
+        animation.setDuration(240)
+        animation.setStartValue(0.25)
+        animation.setEndValue(1.0)
+        animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+        def _cleanup() -> None:
+            target_page.setGraphicsEffect(None)
+
+        animation.finished.connect(_cleanup)
+        self._section_transition = animation
+        animation.start()
+
+    def _connect_signals(self) -> None:
+        self._state_machine.state_changed.connect(self._on_state_changed)
+        self._timer.tick.connect(self._on_tick)
+        self._timer.session_completed.connect(self._on_session_completed)
+
+        self._watchdog.violation_detected.connect(self._on_violation_detected)
+        self._watchdog.monitor_error.connect(self._append_log)
+
+        self._scheduler.block_applied.connect(self._on_scheduler_block)
+        self._scheduler.unblock_applied.connect(self._on_scheduler_unblock)
+        self._scheduler.scheduler_error.connect(self._append_log)
+        self._rounds_spin.valueChanged.connect(self._on_rounds_value_changed)
+
+    def _build_overlay_windows(self) -> None:
+        self._overlays.clear()
+        screens = QGuiApplication.screens()
+        for idx, _ in enumerate(screens):
+            self._overlays.append(OverlayWindow(screen_index=idx))
+
+    def _load_config_into_form(self) -> None:
+        timing = self._config_manager.get_timing()
+        ui = self._config_manager.get_ui_customization()
+        whitelist = self._config_manager.get_process_whitelist()
+        network = self._config_manager.get_network_blacklist()
+
+        self._work_spin.setValue(timing["work_duration_minutes"])
+        self._break_spin.setValue(timing["break_duration_minutes"])
+        self._rounds_spin.setValue(timing.get("focus_rounds", 4))
+        self._bg_path_edit.setText(ui["background_image_path"])
+        self._motto_edit.setText(ui["motto"])
+        self._whitelist_edit.setPlainText("\n".join(whitelist))
+        self._target_focus_rounds = self._rounds_spin.value()
+        self._current_focus_round = 0
+        self._update_round_status(reset=True)
+
+        network_lines = []
+        for rule in network:
+            active_int = 1 if bool(rule.get("is_active", True)) else 0
+            network_lines.append(
+                f"{rule.get('domain', '')},{rule.get('start_time', '08:00')},{rule.get('end_time', '11:30')},{active_int}"
+            )
+        self._network_rules_edit.setPlainText("\n".join(network_lines))
+
+    def _save_form_to_config(self) -> None:
+        timing = {
+            "work_duration_minutes": self._work_spin.value(),
+            "break_duration_minutes": self._break_spin.value(),
+            "focus_rounds": self._rounds_spin.value(),
+        }
+        ui_customization = {
+            "background_image_path": self._bg_path_edit.text().strip(),
+            "motto": self._motto_edit.text().strip(),
+        }
+        process_whitelist = self._collect_whitelist()
+        network_blacklist = self._collect_network_rules()
+
+        self._config_manager.update(
+            timing=timing,
+            ui_customization=ui_customization,
+            process_whitelist=process_whitelist,
+            network_blacklist=network_blacklist,
+        )
+        self._refresh_overlay_content()
+        self._append_log("配置已保存")
+
+    @Slot(int)
+    def _on_rounds_value_changed(self, value: int) -> None:
+        if self._state_machine.state == PomodoroState.INIT:
+            self._target_focus_rounds = max(1, value)
+            self._update_round_status(reset=True)
+
+    def _collect_whitelist(self) -> list[str]:
+        lines = self._whitelist_edit.toPlainText().splitlines()
+        names = [line.strip().lower() for line in lines if line.strip()]
+        if "python.exe" not in names:
+            names.append("python.exe")
+        if "pythonw.exe" not in names:
+            names.append("pythonw.exe")
+        return sorted(set(names))
+
+    def _collect_network_rules(self) -> list[dict[str, Any]]:
+        rules: list[dict[str, Any]] = []
+        for raw in self._network_rules_edit.toPlainText().splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 4:
+                continue
+            domain, start, end, active = parts[:4]
+            rules.append(
+                {
+                    "domain": domain,
+                    "start_time": start,
+                    "end_time": end,
+                    "is_active": active in {"1", "true", "True", "yes", "on"},
+                }
+            )
+        return rules
+
+    def _refresh_overlay_content(self) -> None:
+        ui = self._config_manager.get_ui_customization()
+        motto = ui.get("motto", "")
+        bg_path = ui.get("background_image_path", "")
+        for overlay in self._overlays:
+            overlay.update_content(motto, bg_path)
+
+    @Slot()
+    def _on_pick_image(self) -> None:
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择背景图片",
+            str(Path.cwd()),
+            "Images (*.png *.jpg *.jpeg *.bmp)",
+        )
+        if selected:
+            self._bg_path_edit.setText(selected)
+
+    @Slot()
+    def _on_start_focus(self) -> None:
+        self._save_form_to_config()
+        self._target_focus_rounds = max(1, self._rounds_spin.value())
+        self._current_focus_round = 1
+        self._update_round_status()
+        self._state_machine.to_focus()
+
+    @Slot()
+    def _on_stop(self) -> None:
+        self._timer.stop()
+        self._current_focus_round = 0
+        self._update_round_status(reset=True)
+        self._state_machine.to_init()
+        self._append_log("已停止并重置")
+
+    @Slot(str)
+    def _on_state_changed(self, state_text: str) -> None:
+        self._status_label.setText(f"状态: {state_text}")
+        state = PomodoroState(state_text)
+        if state == PomodoroState.FOCUS:
+            self._show_overlays()
+            self._watchdog.start()
+            self._timer.start_focus(self._work_spin.value())
+            self._update_round_status()
+            self._append_log("进入专注态")
+        elif state == PomodoroState.BREAK:
+            self._hide_overlays()
+            self._watchdog.stop()
+            self._timer.start_break(self._break_spin.value())
+            self._append_log("进入休息态")
+        else:
+            self._hide_overlays()
+            self._watchdog.stop()
+            self._current_focus_round = 0
+            self._update_round_status(reset=True)
+            self._append_log("进入就绪态")
+
+    @Slot(int, str)
+    def _on_tick(self, seconds_left: int, phase: str) -> None:
+        mm = seconds_left // 60
+        ss = seconds_left % 60
+        self._countdown_label.setText(f"剩余: {mm:02d}:{ss:02d} ({phase})")
+
+    @Slot(str)
+    def _on_session_completed(self, completed_phase: str) -> None:
+        if completed_phase == "FOCUS":
+            if self._current_focus_round >= self._target_focus_rounds:
+                self._append_log("所有专注轮次完成，自动回到就绪态")
+                self._state_machine.to_init()
+                return
+            self._append_log("专注结束，切换到休息")
+            self._state_machine.to_break()
+        elif completed_phase == "BREAK":
+            self._current_focus_round += 1
+            self._append_log(f"休息结束，开始第 {self._current_focus_round} 轮专注")
+            self._state_machine.to_focus()
+
+    @Slot(str)
+    def _on_violation_detected(self, process_name: str) -> None:
+        self._append_log(f"检测到违规进程: {process_name}，尝试夺回焦点")
+        self._show_overlays()
+        self._process_monitor.force_bring_to_front(OverlayWindow.WINDOW_TITLE)
+
+    @Slot(list)
+    def _on_scheduler_block(self, domains: list) -> None:
+        self._append_log(f"网络阻断已应用: {', '.join(domains)}")
+
+    @Slot()
+    def _on_scheduler_unblock(self) -> None:
+        self._append_log("网络阻断已解除")
+
+    @Slot(str)
+    def _append_log(self, message: str) -> None:
+        self._log_edit.append(message)
+
+    def _show_overlays(self) -> None:
+        self._refresh_overlay_content()
+        for overlay in self._overlays:
+            overlay.showFullScreen()
+            overlay.raise_()
+            overlay.activateWindow()
+
+    def _hide_overlays(self) -> None:
+        for overlay in self._overlays:
+            overlay.hide()
+
+    def _update_round_status(self, reset: bool = False) -> None:
+        if reset:
+            self._round_label.setText(f"轮次: 0/{self._target_focus_rounds}")
+            return
+        self._round_label.setText(f"轮次: {self._current_focus_round}/{self._target_focus_rounds}")
