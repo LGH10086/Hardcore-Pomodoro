@@ -16,6 +16,7 @@ from os_services.base import IProcessMonitor, OSInteractError
 class WatchdogService(QObject):
     violation_detected = Signal(str)
     allowed_foreground_detected = Signal(str)
+    foreground_evaluated = Signal(object)
     monitor_error = Signal(str)
 
     def __init__(
@@ -62,9 +63,16 @@ class WatchdogService(QObject):
             try:
                 info = self._process_monitor.get_foreground_process_info()
                 snapshot = self._snapshot_provider()
-                is_allowed = self._is_allowed(info.pid, info.name, info.exe_path, snapshot.process_rules)
+                is_allowed, detail = self._evaluate_foreground(
+                    info.pid,
+                    info.name,
+                    info.exe_path,
+                    snapshot.process_rules,
+                )
                 normalized_path = str(info.exe_path or "").strip().lower()
                 current_key = (int(info.pid), normalized_path)
+
+                self.foreground_evaluated.emit(detail)
 
                 if is_allowed:
                     # Emit whenever allowed foreground app changes, so UI can react
@@ -82,17 +90,41 @@ class WatchdogService(QObject):
                 self.monitor_error.emit(f"Watchdog unexpected error: {exc}")
             time.sleep(self._poll_interval)
 
-    def _is_allowed(self, pid: int, name: str, exe_path: str, rules: tuple[ProcessRule, ...]) -> bool:
+    def _evaluate_foreground(
+        self,
+        pid: int,
+        name: str,
+        exe_path: str,
+        rules: tuple[ProcessRule, ...],
+    ) -> tuple[bool, dict[str, object]]:
         normalized_name = str(name).lower().strip()
         normalized_path = str(exe_path or "").strip().lower()
         cache_key = (pid, normalized_path)
+
+        detail: dict[str, object] = {
+            "pid": int(pid),
+            "name": normalized_name,
+            "path": str(exe_path or ""),
+            "allowed": False,
+            "reason": "未命中白名单规则",
+            "matched_rule": "",
+            "require_signature": False,
+            "signature_ok": None,
+            "from_cache": False,
+        }
+
         if cache_key in self._decision_cache:
-            return self._decision_cache[cache_key]
+            decision = self._decision_cache[cache_key]
+            detail["allowed"] = bool(decision)
+            detail["reason"] = "命中缓存结果"
+            detail["from_cache"] = True
+            return decision, detail
 
         active_rules = [rule for rule in rules if rule.is_active]
         if not active_rules:
             self._remember_decision(cache_key, False)
-            return False
+            detail["reason"] = "没有启用的进程白名单规则"
+            return False, detail
 
         for rule in active_rules:
             if normalized_name != rule.name.lower().strip():
@@ -100,16 +132,31 @@ class WatchdogService(QObject):
 
             rule_path = rule.path.strip().lower()
             if rule_path and rule_path != normalized_path:
+                detail["matched_rule"] = f"{rule.name} | {rule.path or '*'}"
+                detail["reason"] = "进程名匹配，但路径不匹配"
                 continue
 
+            signature_ok: bool | None = None
             if rule.require_signature and not self._is_path_signed(exe_path):
+                signature_ok = False
+                detail["matched_rule"] = f"{rule.name} | {rule.path or '*'}"
+                detail["require_signature"] = True
+                detail["signature_ok"] = signature_ok
+                detail["reason"] = "命中规则但签名校验未通过"
                 continue
 
             self._remember_decision(cache_key, True)
-            return True
+            if rule.require_signature:
+                signature_ok = True
+            detail["allowed"] = True
+            detail["matched_rule"] = f"{rule.name} | {rule.path or '*'}"
+            detail["require_signature"] = bool(rule.require_signature)
+            detail["signature_ok"] = signature_ok
+            detail["reason"] = "命中白名单规则"
+            return True, detail
 
         self._remember_decision(cache_key, False)
-        return False
+        return False, detail
 
     def _remember_decision(self, key: tuple[int, str], decision: bool) -> None:
         self._decision_cache[key] = decision

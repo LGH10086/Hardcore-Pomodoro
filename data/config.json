@@ -22,6 +22,12 @@
       "start_time": "08:00",
       "end_time": "11:30",
       "is_active": true
+    },
+    {
+      "domain": "bilibili.com",
+      "start_time": "14:15",
+      "end_time": "14:45",
+      "is_active": true
     }
   ]
 }

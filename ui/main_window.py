@@ -359,6 +359,30 @@ class MainWindow(QMainWindow):
         intro.setObjectName("sectionIntro")
         layout.addWidget(intro)
 
+        realtime_box = QGroupBox("实时前台判定")
+        realtime_grid = QGridLayout()
+        self._rt_state_value = QLabel("-")
+        self._rt_name_value = QLabel("-")
+        self._rt_path_value = QLabel("-")
+        self._rt_rule_value = QLabel("-")
+        self._rt_reason_value = QLabel("-")
+        self._rt_signature_value = QLabel("-")
+
+        realtime_grid.addWidget(QLabel("判定"), 0, 0)
+        realtime_grid.addWidget(self._rt_state_value, 0, 1)
+        realtime_grid.addWidget(QLabel("前台进程"), 1, 0)
+        realtime_grid.addWidget(self._rt_name_value, 1, 1)
+        realtime_grid.addWidget(QLabel("路径"), 2, 0)
+        realtime_grid.addWidget(self._rt_path_value, 2, 1)
+        realtime_grid.addWidget(QLabel("命中规则"), 3, 0)
+        realtime_grid.addWidget(self._rt_rule_value, 3, 1)
+        realtime_grid.addWidget(QLabel("原因"), 4, 0)
+        realtime_grid.addWidget(self._rt_reason_value, 4, 1)
+        realtime_grid.addWidget(QLabel("签名校验"), 5, 0)
+        realtime_grid.addWidget(self._rt_signature_value, 5, 1)
+        realtime_box.setLayout(realtime_grid)
+        layout.addWidget(realtime_box)
+
         self._log_edit = QTextEdit()
         self._log_edit.setReadOnly(True)
         self._log_edit.setPlaceholderText("日志会实时显示在这里...")
@@ -367,6 +391,7 @@ class MainWindow(QMainWindow):
         clear_btn = QPushButton("清空日志")
         clear_btn.clicked.connect(self._log_edit.clear)
         layout.addWidget(clear_btn)
+        self._reset_realtime_panel()
         return page
 
     def _apply_theme(self) -> None:
@@ -559,6 +584,7 @@ class MainWindow(QMainWindow):
 
         self._watchdog.violation_detected.connect(self._on_violation_detected)
         self._watchdog.allowed_foreground_detected.connect(self._on_allowed_foreground_detected)
+        self._watchdog.foreground_evaluated.connect(self._on_foreground_evaluated)
         self._watchdog.monitor_error.connect(self._append_log)
 
         self._scheduler.block_applied.connect(self._on_scheduler_block)
@@ -671,7 +697,7 @@ class MainWindow(QMainWindow):
             end_item = self._network_table.item(row, 2)
             active_item = self._network_table.item(row, 3)
 
-            domain = (domain_item.text() if domain_item else "").strip().lower()
+            domain = self._normalize_domain(domain_item.text() if domain_item else "")
             start = (start_item.text() if start_item else "").strip() or "00:00"
             end = (end_item.text() if end_item else "").strip() or "23:59"
             active = self._is_yes(active_item.text() if active_item else "是")
@@ -739,7 +765,7 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _on_add_network_rule(self) -> None:
-        domain = self._network_domain_input.text().strip().lower()
+        domain = self._normalize_domain(self._network_domain_input.text())
         if not domain:
             QMessageBox.warning(self, "输入不完整", "请先填写域名。")
             return
@@ -763,6 +789,19 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _is_yes(value: str) -> bool:
         return value.strip() in {"是", "1", "true", "True", "yes", "on"}
+
+    @staticmethod
+    def _normalize_domain(value: str) -> str:
+        domain = str(value or "").strip().lower()
+        if not domain:
+            return ""
+        if "://" in domain:
+            domain = domain.split("://", 1)[1]
+        domain = domain.split("/", 1)[0]
+        domain = domain.split(":", 1)[0]
+        if domain.startswith("www."):
+            domain = domain[4:]
+        return domain.strip(".")
 
     def _refresh_overlay_content(self) -> None:
         ui = self._config_manager.get_ui_customization()
@@ -896,6 +935,37 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def _append_log(self, message: str) -> None:
         self._log_edit.append(message)
+
+    @Slot(object)
+    def _on_foreground_evaluated(self, detail: object) -> None:
+        if not isinstance(detail, dict):
+            return
+
+        allowed = bool(detail.get("allowed", False))
+        self._rt_state_value.setText("放行" if allowed else "拦截")
+        self._rt_name_value.setText(str(detail.get("name") or "-"))
+        self._rt_path_value.setText(str(detail.get("path") or "-"))
+        self._rt_rule_value.setText(str(detail.get("matched_rule") or "-"))
+        self._rt_reason_value.setText(str(detail.get("reason") or "-"))
+
+        signature_ok = detail.get("signature_ok")
+        require_signature = bool(detail.get("require_signature", False))
+        if not require_signature:
+            self._rt_signature_value.setText("未要求")
+        elif signature_ok is True:
+            self._rt_signature_value.setText("通过")
+        elif signature_ok is False:
+            self._rt_signature_value.setText("不通过")
+        else:
+            self._rt_signature_value.setText("未知")
+
+    def _reset_realtime_panel(self) -> None:
+        self._rt_state_value.setText("-")
+        self._rt_name_value.setText("-")
+        self._rt_path_value.setText("-")
+        self._rt_rule_value.setText("-")
+        self._rt_reason_value.setText("-")
+        self._rt_signature_value.setText("-")
 
     def _show_overlays(self) -> None:
         self._refresh_overlay_content()
