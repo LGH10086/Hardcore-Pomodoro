@@ -337,8 +337,12 @@ class MainWindow(QMainWindow):
         network_remove_btn = QPushButton("删除选中网络规则")
         network_remove_btn.setObjectName("btnWarn")
         network_remove_btn.clicked.connect(self._on_remove_network_rule)
+        network_apply_now_btn = QPushButton("立即应用网络规则")
+        network_apply_now_btn.setObjectName("btnPrimary")
+        network_apply_now_btn.clicked.connect(self._on_apply_network_rules_now)
         network_add_row.addWidget(network_add_btn)
         network_add_row.addWidget(network_remove_btn)
+        network_add_row.addWidget(network_apply_now_btn)
         nl.addLayout(network_add_row)
 
         layout.addWidget(whitelist_box)
@@ -785,6 +789,12 @@ class MainWindow(QMainWindow):
         row = self._network_table.currentRow()
         if row >= 0:
             self._network_table.removeRow(row)
+
+    @Slot()
+    def _on_apply_network_rules_now(self) -> None:
+        self._save_form_to_config()
+        self._scheduler.apply_now()
+        self._append_log("已手动触发网络规则即时评估")
 
     @staticmethod
     def _is_yes(value: str) -> bool:

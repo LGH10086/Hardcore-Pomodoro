@@ -27,7 +27,9 @@ class SchedulerService(QObject):
         self._poll_interval_seconds = poll_interval_seconds
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
+        self._apply_lock = threading.Lock()
         self._is_blocking_active = False
+        self._active_domains: list[str] = []
 
     def start(self) -> None:
         if self.is_running:
@@ -51,22 +53,37 @@ class SchedulerService(QObject):
 
     def _run(self) -> None:
         while not self._stop_event.is_set():
+            self.apply_now()
+            time.sleep(self._poll_interval_seconds)
+
+    def apply_now(self) -> None:
+        with self._apply_lock:
             try:
-                domains_to_block = self._get_active_domains_for_now()
-                if domains_to_block and not self._is_blocking_active:
-                    if self._network_blocker.block_domains(domains_to_block):
-                        self._is_blocking_active = True
-                        self.block_applied.emit(domains_to_block)
-                elif not domains_to_block and self._is_blocking_active:
-                    self._safe_unblock()
+                self._evaluate_and_apply()
             except Exception as exc:  # pragma: no cover
                 self.scheduler_error.emit(f"Scheduler error: {exc}")
-            time.sleep(self._poll_interval_seconds)
+
+    def _evaluate_and_apply(self) -> None:
+        domains_to_block = self._get_active_domains_for_now()
+        if domains_to_block:
+            # Re-apply when blocked domains changed to keep runtime behavior in sync
+            # with latest rules even before next unblock.
+            domains_changed = domains_to_block != self._active_domains
+            if not self._is_blocking_active or domains_changed:
+                if self._network_blocker.block_domains(domains_to_block):
+                    self._is_blocking_active = True
+                    self._active_domains = list(domains_to_block)
+                    self.block_applied.emit(domains_to_block)
+            return
+
+        if self._is_blocking_active:
+            self._safe_unblock()
 
     def _safe_unblock(self) -> None:
         try:
             if self._network_blocker.unblock_all():
                 self._is_blocking_active = False
+                self._active_domains = []
                 self.unblock_applied.emit()
         except Exception as exc:  # pragma: no cover
             self.scheduler_error.emit(f"Unblock error: {exc}")
