@@ -10,11 +10,11 @@
   },
   "process_whitelist": [
     "chrome.exe",
-    "code.exe",
     "edge.exe",
     "pycharm64.exe",
     "python.exe",
-    "pythonw.exe"
+    "pythonw.exe",
+    "code.exe"
   ],
   "network_blacklist": [
     {

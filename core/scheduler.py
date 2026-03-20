@@ -6,7 +6,7 @@ from datetime import datetime
 
 from PySide6.QtCore import QObject, Signal
 
-from core.config_manager import ConfigManager
+from core.models import PolicySnapshot
 from os_services.base import INetworkBlocker
 
 
@@ -17,12 +17,12 @@ class SchedulerService(QObject):
 
     def __init__(
         self,
-        config_manager: ConfigManager,
+        snapshot_provider,
         network_blocker: INetworkBlocker,
         poll_interval_seconds: int = 30,
     ) -> None:
         super().__init__()
-        self._config_manager = config_manager
+        self._snapshot_provider = snapshot_provider
         self._network_blocker = network_blocker
         self._poll_interval_seconds = poll_interval_seconds
         self._thread: threading.Thread | None = None
@@ -74,14 +74,15 @@ class SchedulerService(QObject):
     def _get_active_domains_for_now(self) -> list[str]:
         now = datetime.now().time()
         active_domains: list[str] = []
-        for rule in self._config_manager.get_network_blacklist():
-            if not bool(rule.get("is_active", True)):
+        snapshot: PolicySnapshot = self._snapshot_provider()
+        for rule in snapshot.network_rules:
+            if not bool(rule.is_active):
                 continue
-            domain = str(rule.get("domain", "")).strip()
+            domain = str(rule.domain).strip()
             if not domain:
                 continue
-            start = self._parse_time(str(rule.get("start_time", "00:00")))
-            end = self._parse_time(str(rule.get("end_time", "23:59")))
+            start = self._parse_time(str(rule.start_time))
+            end = self._parse_time(str(rule.end_time))
             if self._is_now_in_range(now, start, end):
                 active_domains.append(domain)
         return sorted(set(active_domains))

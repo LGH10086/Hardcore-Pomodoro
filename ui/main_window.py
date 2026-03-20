@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QEasingCurve, QPropertyAnimation, Slot
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QComboBox,
     QFileDialog,
     QFrame,
     QGraphicsOpacityEffect,
@@ -21,17 +24,22 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSpinBox,
     QStackedWidget,
+    QTableWidget,
+    QTableWidgetItem,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
 from core.config_manager import ConfigManager
+from core.models import NetworkRule, ProcessRule
+from core.rule_store import RuleStore
 from core.scheduler import SchedulerService
 from core.state_machine import PomodoroState, StateMachine
+from core.strategy_runtime import StrategyRuntime
 from core.timer import PomodoroTimer
 from core.watchdog import WatchdogService
-from os_services.base import IProcessMonitor
+from os_services.base import IProcessMonitor, OSInteractError
 from ui.overlay_window import OverlayWindow
 
 
@@ -44,6 +52,8 @@ class MainWindow(QMainWindow):
         watchdog: WatchdogService,
         scheduler: SchedulerService,
         process_monitor: IProcessMonitor,
+        rule_store: RuleStore,
+        strategy_runtime: StrategyRuntime,
         is_admin: bool,
     ) -> None:
         super().__init__()
@@ -53,6 +63,8 @@ class MainWindow(QMainWindow):
         self._watchdog = watchdog
         self._scheduler = scheduler
         self._process_monitor = process_monitor
+        self._rule_store = rule_store
+        self._strategy_runtime = strategy_runtime
         self._is_admin = is_admin
         self._overlays: list[OverlayWindow] = []
         self._target_focus_rounds = 1
@@ -60,6 +72,7 @@ class MainWindow(QMainWindow):
         self._section_sidebar: QListWidget
         self._section_stack: QStackedWidget
         self._section_transition: QPropertyAnimation | None = None
+        self._self_process_names = {"python.exe", "pythonw.exe", Path(sys.executable).name.lower()}
 
         self.setWindowTitle("Hardcore Pomodoro")
         self.resize(1160, 780)
@@ -99,11 +112,35 @@ class MainWindow(QMainWindow):
         self._bg_path_edit = QLineEdit()
         self._motto_edit = QLineEdit()
 
-        self._whitelist_edit = QTextEdit()
-        self._whitelist_edit.setPlaceholderText("每行一个进程名，例如 code.exe")
+        self._process_table = QTableWidget(0, 4)
+        self._process_table.setHorizontalHeaderLabels(["进程名", "绝对路径(可选)", "要求签名", "启用"])
+        self._process_table.horizontalHeader().setStretchLastSection(True)
+        self._process_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._process_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
 
-        self._network_rules_edit = QTextEdit()
-        self._network_rules_edit.setPlaceholderText("每行格式: domain,start,end,active(1或0)")
+        self._network_table = QTableWidget(0, 4)
+        self._network_table.setHorizontalHeaderLabels(["域名", "开始时间", "结束时间", "启用"])
+        self._network_table.horizontalHeader().setStretchLastSection(True)
+        self._network_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._network_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+
+        self._process_name_input = QLineEdit()
+        self._process_name_input.setPlaceholderText("例如 code.exe")
+        self._process_path_input = QLineEdit()
+        self._process_path_input.setPlaceholderText("可选，例如 C:/Program Files/Microsoft VS Code/Code.exe")
+        self._process_signature_combo = QComboBox()
+        self._process_signature_combo.addItems(["否", "是"])
+        self._process_active_combo = QComboBox()
+        self._process_active_combo.addItems(["是", "否"])
+
+        self._network_domain_input = QLineEdit()
+        self._network_domain_input.setPlaceholderText("例如 bilibili.com")
+        self._network_start_input = QLineEdit()
+        self._network_start_input.setPlaceholderText("08:00")
+        self._network_end_input = QLineEdit()
+        self._network_end_input.setPlaceholderText("11:30")
+        self._network_active_combo = QComboBox()
+        self._network_active_combo.addItems(["是", "否"])
 
         shell_layout = QHBoxLayout(root)
         shell_layout.setContentsMargins(18, 18, 18, 18)
@@ -250,17 +287,59 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
 
-        intro = QLabel("维护允许切换的进程与定时网络黑名单规则。")
+        intro = QLabel("维护允许切换的进程身份规则与定时网络规则（DNS 主策略 + hosts 兜底）。")
         intro.setObjectName("sectionIntro")
         layout.addWidget(intro)
 
         whitelist_box = QGroupBox("进程白名单")
         wl = QVBoxLayout(whitelist_box)
-        wl.addWidget(self._whitelist_edit)
+        wl.addWidget(QLabel("通过表格维护规则，支持一键添加/删除。"))
+        wl.addWidget(self._process_table)
+
+        process_add_row = QHBoxLayout()
+        process_add_row.addWidget(self._process_name_input, 2)
+        process_add_row.addWidget(self._process_path_input, 3)
+        process_add_row.addWidget(QLabel("签名"))
+        process_add_row.addWidget(self._process_signature_combo)
+        process_add_row.addWidget(QLabel("启用"))
+        process_add_row.addWidget(self._process_active_combo)
+
+        process_pick_exe_btn = QPushButton("选择应用(.exe)")
+        process_pick_exe_btn.clicked.connect(self._on_pick_process_executable)
+        process_pick_foreground_btn = QPushButton("抓取当前前台应用")
+        process_pick_foreground_btn.clicked.connect(self._on_pick_foreground_process)
+
+        process_add_btn = QPushButton("添加进程规则")
+        process_add_btn.clicked.connect(self._on_add_process_rule)
+        process_remove_btn = QPushButton("删除选中进程规则")
+        process_remove_btn.setObjectName("btnWarn")
+        process_remove_btn.clicked.connect(self._on_remove_process_rule)
+        process_add_row.addWidget(process_pick_exe_btn)
+        process_add_row.addWidget(process_pick_foreground_btn)
+        process_add_row.addWidget(process_add_btn)
+        process_add_row.addWidget(process_remove_btn)
+        wl.addLayout(process_add_row)
 
         network_box = QGroupBox("网络黑名单计划")
         nl = QVBoxLayout(network_box)
-        nl.addWidget(self._network_rules_edit)
+        nl.addWidget(QLabel("按时间段维护域名规则，支持一键添加/删除。"))
+        nl.addWidget(self._network_table)
+
+        network_add_row = QHBoxLayout()
+        network_add_row.addWidget(self._network_domain_input, 2)
+        network_add_row.addWidget(self._network_start_input)
+        network_add_row.addWidget(self._network_end_input)
+        network_add_row.addWidget(QLabel("启用"))
+        network_add_row.addWidget(self._network_active_combo)
+
+        network_add_btn = QPushButton("添加网络规则")
+        network_add_btn.clicked.connect(self._on_add_network_rule)
+        network_remove_btn = QPushButton("删除选中网络规则")
+        network_remove_btn.setObjectName("btnWarn")
+        network_remove_btn.clicked.connect(self._on_remove_network_rule)
+        network_add_row.addWidget(network_add_btn)
+        network_add_row.addWidget(network_remove_btn)
+        nl.addLayout(network_add_row)
 
         layout.addWidget(whitelist_box)
         layout.addWidget(network_box)
@@ -392,6 +471,27 @@ class MainWindow(QMainWindow):
                 padding: 6px;
                 selection-background-color: #0ea5e9;
             }
+            QTableWidget {
+                border: 1px solid rgba(148, 163, 184, 0.45);
+                border-radius: 10px;
+                background: rgba(15, 23, 42, 0.78);
+                gridline-color: rgba(148, 163, 184, 0.24);
+                color: #f3f4f6;
+            }
+            QHeaderView::section {
+                background: rgba(2, 6, 23, 0.9);
+                color: #fde68a;
+                padding: 6px;
+                border: 1px solid rgba(148, 163, 184, 0.24);
+                font-weight: 700;
+            }
+            QComboBox {
+                border: 1px solid rgba(148, 163, 184, 0.45);
+                border-radius: 8px;
+                background: rgba(15, 23, 42, 0.72);
+                color: #f3f4f6;
+                padding: 4px 8px;
+            }
             QPushButton {
                 border: 1px solid rgba(251, 191, 36, 0.55);
                 border-radius: 10px;
@@ -458,6 +558,7 @@ class MainWindow(QMainWindow):
         self._timer.session_completed.connect(self._on_session_completed)
 
         self._watchdog.violation_detected.connect(self._on_violation_detected)
+        self._watchdog.allowed_foreground_detected.connect(self._on_allowed_foreground_detected)
         self._watchdog.monitor_error.connect(self._append_log)
 
         self._scheduler.block_applied.connect(self._on_scheduler_block)
@@ -474,26 +575,19 @@ class MainWindow(QMainWindow):
     def _load_config_into_form(self) -> None:
         timing = self._config_manager.get_timing()
         ui = self._config_manager.get_ui_customization()
-        whitelist = self._config_manager.get_process_whitelist()
-        network = self._config_manager.get_network_blacklist()
+        process_rules = self._rule_store.get_process_rules()
+        network_rules = self._rule_store.get_network_rules()
 
         self._work_spin.setValue(timing["work_duration_minutes"])
         self._break_spin.setValue(timing["break_duration_minutes"])
         self._rounds_spin.setValue(timing.get("focus_rounds", 4))
         self._bg_path_edit.setText(ui["background_image_path"])
         self._motto_edit.setText(ui["motto"])
-        self._whitelist_edit.setPlainText("\n".join(whitelist))
+        self._load_process_table(process_rules)
         self._target_focus_rounds = self._rounds_spin.value()
         self._current_focus_round = 0
         self._update_round_status(reset=True)
-
-        network_lines = []
-        for rule in network:
-            active_int = 1 if bool(rule.get("is_active", True)) else 0
-            network_lines.append(
-                f"{rule.get('domain', '')},{rule.get('start_time', '08:00')},{rule.get('end_time', '11:30')},{active_int}"
-            )
-        self._network_rules_edit.setPlainText("\n".join(network_lines))
+        self._load_network_table(network_rules)
 
     def _save_form_to_config(self) -> None:
         timing = {
@@ -505,8 +599,23 @@ class MainWindow(QMainWindow):
             "background_image_path": self._bg_path_edit.text().strip(),
             "motto": self._motto_edit.text().strip(),
         }
-        process_whitelist = self._collect_whitelist()
-        network_blacklist = self._collect_network_rules()
+        process_rules = self._collect_process_rules()
+        network_rules = self._collect_network_rules()
+
+        self._rule_store.replace_process_rules(process_rules)
+        self._rule_store.replace_network_rules(network_rules)
+        self._strategy_runtime.reload()
+
+        process_whitelist = [rule.name for rule in process_rules if rule.is_active]
+        network_blacklist = [
+            {
+                "domain": rule.domain,
+                "start_time": rule.start_time,
+                "end_time": rule.end_time,
+                "is_active": rule.is_active,
+            }
+            for rule in network_rules
+        ]
 
         self._config_manager.update(
             timing=timing,
@@ -515,7 +624,7 @@ class MainWindow(QMainWindow):
             network_blacklist=network_blacklist,
         )
         self._refresh_overlay_content()
-        self._append_log("配置已保存")
+        self._append_log("配置已保存并刷新策略快照")
 
     @Slot(int)
     def _on_rounds_value_changed(self, value: int) -> None:
@@ -523,34 +632,137 @@ class MainWindow(QMainWindow):
             self._target_focus_rounds = max(1, value)
             self._update_round_status(reset=True)
 
-    def _collect_whitelist(self) -> list[str]:
-        lines = self._whitelist_edit.toPlainText().splitlines()
-        names = [line.strip().lower() for line in lines if line.strip()]
-        if "python.exe" not in names:
-            names.append("python.exe")
-        if "pythonw.exe" not in names:
-            names.append("pythonw.exe")
-        return sorted(set(names))
+    def _collect_process_rules(self) -> list[ProcessRule]:
+        rules: list[ProcessRule] = []
+        for row in range(self._process_table.rowCount()):
+            name_item = self._process_table.item(row, 0)
+            path_item = self._process_table.item(row, 1)
+            sign_item = self._process_table.item(row, 2)
+            active_item = self._process_table.item(row, 3)
 
-    def _collect_network_rules(self) -> list[dict[str, Any]]:
-        rules: list[dict[str, Any]] = []
-        for raw in self._network_rules_edit.toPlainText().splitlines():
-            line = raw.strip()
-            if not line:
+            name = (name_item.text() if name_item else "").strip().lower()
+            path = (path_item.text() if path_item else "").strip()
+            require_sig = self._is_yes(sign_item.text() if sign_item else "否")
+            active = self._is_yes(active_item.text() if active_item else "是")
+            if not name:
                 continue
-            parts = [p.strip() for p in line.split(",")]
-            if len(parts) < 4:
-                continue
-            domain, start, end, active = parts[:4]
+
             rules.append(
-                {
-                    "domain": domain,
-                    "start_time": start,
-                    "end_time": end,
-                    "is_active": active in {"1", "true", "True", "yes", "on"},
-                }
+                ProcessRule(
+                    name=name,
+                    path=path,
+                    require_signature=require_sig,
+                    is_active=active,
+                )
+            )
+
+        must_have = {rule.name for rule in rules}
+        if "python.exe" not in must_have:
+            rules.append(ProcessRule(name="python.exe"))
+        if "pythonw.exe" not in must_have:
+            rules.append(ProcessRule(name="pythonw.exe"))
+        return rules
+
+    def _collect_network_rules(self) -> list[NetworkRule]:
+        rules: list[NetworkRule] = []
+        for row in range(self._network_table.rowCount()):
+            domain_item = self._network_table.item(row, 0)
+            start_item = self._network_table.item(row, 1)
+            end_item = self._network_table.item(row, 2)
+            active_item = self._network_table.item(row, 3)
+
+            domain = (domain_item.text() if domain_item else "").strip().lower()
+            start = (start_item.text() if start_item else "").strip() or "00:00"
+            end = (end_item.text() if end_item else "").strip() or "23:59"
+            active = self._is_yes(active_item.text() if active_item else "是")
+            if not domain:
+                continue
+
+            rules.append(
+                NetworkRule(
+                    domain=domain,
+                    start_time=start,
+                    end_time=end,
+                    is_active=active,
+                )
             )
         return rules
+
+    def _load_process_table(self, rules: list[ProcessRule]) -> None:
+        self._process_table.setRowCount(0)
+        for rule in rules:
+            self._append_process_row(rule.name, rule.path, rule.require_signature, rule.is_active)
+
+    def _load_network_table(self, rules: list[NetworkRule]) -> None:
+        self._network_table.setRowCount(0)
+        for rule in rules:
+            self._append_network_row(rule.domain, rule.start_time, rule.end_time, rule.is_active)
+
+    def _append_process_row(self, name: str, path: str, require_signature: bool, is_active: bool) -> None:
+        row = self._process_table.rowCount()
+        self._process_table.insertRow(row)
+        self._process_table.setItem(row, 0, QTableWidgetItem(name))
+        self._process_table.setItem(row, 1, QTableWidgetItem(path))
+        self._process_table.setItem(row, 2, QTableWidgetItem("是" if require_signature else "否"))
+        self._process_table.setItem(row, 3, QTableWidgetItem("是" if is_active else "否"))
+
+    def _append_network_row(self, domain: str, start_time: str, end_time: str, is_active: bool) -> None:
+        row = self._network_table.rowCount()
+        self._network_table.insertRow(row)
+        self._network_table.setItem(row, 0, QTableWidgetItem(domain))
+        self._network_table.setItem(row, 1, QTableWidgetItem(start_time))
+        self._network_table.setItem(row, 2, QTableWidgetItem(end_time))
+        self._network_table.setItem(row, 3, QTableWidgetItem("是" if is_active else "否"))
+
+    @Slot()
+    def _on_add_process_rule(self) -> None:
+        name = self._process_name_input.text().strip().lower()
+        if not name:
+            QMessageBox.warning(self, "输入不完整", "请先填写进程名。")
+            return
+
+        path = self._process_path_input.text().strip()
+        require_signature = self._process_signature_combo.currentText() == "是"
+        is_active = self._process_active_combo.currentText() == "是"
+        self._append_process_row(name, path, require_signature, is_active)
+
+        self._process_name_input.clear()
+        self._process_path_input.clear()
+        self._process_signature_combo.setCurrentIndex(0)
+        self._process_active_combo.setCurrentIndex(0)
+
+    @Slot()
+    def _on_remove_process_rule(self) -> None:
+        row = self._process_table.currentRow()
+        if row >= 0:
+            self._process_table.removeRow(row)
+
+    @Slot()
+    def _on_add_network_rule(self) -> None:
+        domain = self._network_domain_input.text().strip().lower()
+        if not domain:
+            QMessageBox.warning(self, "输入不完整", "请先填写域名。")
+            return
+
+        start_time = self._network_start_input.text().strip() or "00:00"
+        end_time = self._network_end_input.text().strip() or "23:59"
+        is_active = self._network_active_combo.currentText() == "是"
+        self._append_network_row(domain, start_time, end_time, is_active)
+
+        self._network_domain_input.clear()
+        self._network_start_input.clear()
+        self._network_end_input.clear()
+        self._network_active_combo.setCurrentIndex(0)
+
+    @Slot()
+    def _on_remove_network_rule(self) -> None:
+        row = self._network_table.currentRow()
+        if row >= 0:
+            self._network_table.removeRow(row)
+
+    @staticmethod
+    def _is_yes(value: str) -> bool:
+        return value.strip() in {"是", "1", "true", "True", "yes", "on"}
 
     def _refresh_overlay_content(self) -> None:
         ui = self._config_manager.get_ui_customization()
@@ -569,6 +781,32 @@ class MainWindow(QMainWindow):
         )
         if selected:
             self._bg_path_edit.setText(selected)
+
+    @Slot()
+    def _on_pick_process_executable(self) -> None:
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择应用可执行文件",
+            str(Path.cwd()),
+            "Applications (*.exe)",
+        )
+        if not selected:
+            return
+
+        exe_path = Path(selected)
+        self._process_name_input.setText(exe_path.name.lower())
+        self._process_path_input.setText(str(exe_path))
+
+    @Slot()
+    def _on_pick_foreground_process(self) -> None:
+        try:
+            process_info = self._process_monitor.get_foreground_process_info()
+        except OSInteractError as exc:
+            QMessageBox.warning(self, "抓取失败", f"无法读取当前前台应用: {exc}")
+            return
+
+        self._process_name_input.setText(process_info.name.lower())
+        self._process_path_input.setText(process_info.exe_path)
 
     @Slot()
     def _on_start_focus(self) -> None:
@@ -591,7 +829,7 @@ class MainWindow(QMainWindow):
         self._status_label.setText(f"状态: {state_text}")
         state = PomodoroState(state_text)
         if state == PomodoroState.FOCUS:
-            self._show_overlays()
+            self._hide_overlays()
             self._watchdog.start()
             self._timer.start_focus(self._work_spin.value())
             self._update_round_status()
@@ -630,9 +868,22 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _on_violation_detected(self, process_name: str) -> None:
+        if self._state_machine.state != PomodoroState.FOCUS:
+            return
         self._append_log(f"检测到违规进程: {process_name}，尝试夺回焦点")
         self._show_overlays()
         self._process_monitor.force_bring_to_front(OverlayWindow.WINDOW_TITLE)
+
+    @Slot(str)
+    def _on_allowed_foreground_detected(self, process_name: str) -> None:
+        if self._state_machine.state != PomodoroState.FOCUS:
+            return
+        allowed_process = process_name.split("|", 1)[0].strip().lower()
+        if any(overlay.isVisible() for overlay in self._overlays) and allowed_process in self._self_process_names:
+            self._append_log(f"忽略应用自身前台事件: {process_name}")
+            return
+        self._append_log(f"已回到白名单进程: {process_name}")
+        self._hide_overlays()
 
     @Slot(list)
     def _on_scheduler_block(self, domains: list) -> None:

@@ -14,7 +14,8 @@ class OverlayWindow(QWidget):
         super().__init__()
         self.setWindowTitle(self.WINDOW_TITLE)
         self.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint
+            Qt.WindowType.Window
+            | Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
             | Qt.WindowType.Tool
         )
