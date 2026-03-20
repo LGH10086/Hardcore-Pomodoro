@@ -6,7 +6,7 @@ from datetime import datetime
 
 from PySide6.QtCore import QObject, Signal
 
-from core.config_manager import ConfigManager
+from core.models import PolicySnapshot
 from os_services.base import INetworkBlocker
 
 
@@ -17,17 +17,19 @@ class SchedulerService(QObject):
 
     def __init__(
         self,
-        config_manager: ConfigManager,
+        snapshot_provider,
         network_blocker: INetworkBlocker,
         poll_interval_seconds: int = 30,
     ) -> None:
         super().__init__()
-        self._config_manager = config_manager
+        self._snapshot_provider = snapshot_provider
         self._network_blocker = network_blocker
         self._poll_interval_seconds = poll_interval_seconds
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
+        self._apply_lock = threading.Lock()
         self._is_blocking_active = False
+        self._active_domains: list[str] = []
 
     def start(self) -> None:
         if self.is_running:
@@ -51,22 +53,37 @@ class SchedulerService(QObject):
 
     def _run(self) -> None:
         while not self._stop_event.is_set():
+            self.apply_now()
+            time.sleep(self._poll_interval_seconds)
+
+    def apply_now(self) -> None:
+        with self._apply_lock:
             try:
-                domains_to_block = self._get_active_domains_for_now()
-                if domains_to_block and not self._is_blocking_active:
-                    if self._network_blocker.block_domains(domains_to_block):
-                        self._is_blocking_active = True
-                        self.block_applied.emit(domains_to_block)
-                elif not domains_to_block and self._is_blocking_active:
-                    self._safe_unblock()
+                self._evaluate_and_apply()
             except Exception as exc:  # pragma: no cover
                 self.scheduler_error.emit(f"Scheduler error: {exc}")
-            time.sleep(self._poll_interval_seconds)
+
+    def _evaluate_and_apply(self) -> None:
+        domains_to_block = self._get_active_domains_for_now()
+        if domains_to_block:
+            # Re-apply when blocked domains changed to keep runtime behavior in sync
+            # with latest rules even before next unblock.
+            domains_changed = domains_to_block != self._active_domains
+            if not self._is_blocking_active or domains_changed:
+                if self._network_blocker.block_domains(domains_to_block):
+                    self._is_blocking_active = True
+                    self._active_domains = list(domains_to_block)
+                    self.block_applied.emit(domains_to_block)
+            return
+
+        if self._is_blocking_active:
+            self._safe_unblock()
 
     def _safe_unblock(self) -> None:
         try:
             if self._network_blocker.unblock_all():
                 self._is_blocking_active = False
+                self._active_domains = []
                 self.unblock_applied.emit()
         except Exception as exc:  # pragma: no cover
             self.scheduler_error.emit(f"Unblock error: {exc}")
@@ -74,14 +91,15 @@ class SchedulerService(QObject):
     def _get_active_domains_for_now(self) -> list[str]:
         now = datetime.now().time()
         active_domains: list[str] = []
-        for rule in self._config_manager.get_network_blacklist():
-            if not bool(rule.get("is_active", True)):
+        snapshot: PolicySnapshot = self._snapshot_provider()
+        for rule in snapshot.network_rules:
+            if not bool(rule.is_active):
                 continue
-            domain = str(rule.get("domain", "")).strip()
+            domain = str(rule.domain).strip()
             if not domain:
                 continue
-            start = self._parse_time(str(rule.get("start_time", "00:00")))
-            end = self._parse_time(str(rule.get("end_time", "23:59")))
+            start = self._parse_time(str(rule.start_time))
+            end = self._parse_time(str(rule.end_time))
             if self._is_now_in_range(now, start, end):
                 active_domains.append(domain)
         return sorted(set(active_domains))

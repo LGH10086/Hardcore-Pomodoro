@@ -5,7 +5,7 @@ from ctypes import wintypes
 
 import psutil
 
-from os_services.base import IProcessMonitor, OSInteractError
+from os_services.base import ForegroundProcessInfo, IProcessMonitor, OSInteractError
 
 
 class WindowsProcessMonitor(IProcessMonitor):
@@ -16,6 +16,9 @@ class WindowsProcessMonitor(IProcessMonitor):
         self._kernel32 = ctypes.windll.kernel32
 
     def get_foreground_process_name(self) -> str:
+        return self.get_foreground_process_info().name
+
+    def get_foreground_process_info(self) -> ForegroundProcessInfo:
         hwnd = self._user32.GetForegroundWindow()
         if not hwnd:
             raise OSInteractError("Unable to get foreground window handle")
@@ -26,7 +29,10 @@ class WindowsProcessMonitor(IProcessMonitor):
             raise OSInteractError("Unable to resolve process id from active window")
 
         try:
-            return psutil.Process(pid.value).name().lower()
+            process = psutil.Process(pid.value)
+            name = process.name().lower()
+            exe_path = process.exe()
+            return ForegroundProcessInfo(pid=pid.value, name=name, exe_path=exe_path)
         except (psutil.NoSuchProcess, psutil.AccessDenied) as exc:
             raise OSInteractError(f"Unable to resolve process name for pid {pid.value}: {exc}") from exc
 

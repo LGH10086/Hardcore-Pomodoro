@@ -8,11 +8,16 @@ from pathlib import Path
 from PySide6.QtWidgets import QApplication
 
 from core.config_manager import ConfigManager
+from core.rule_store import RuleStore
 from core.scheduler import SchedulerService
 from core.state_machine import StateMachine
+from core.strategy_compiler import StrategyCompiler
+from core.strategy_runtime import StrategyRuntime
 from core.timer import PomodoroTimer
 from core.watchdog import WatchdogService
 from os_services.base import INetworkBlocker
+from os_services.hybrid_network import HybridNetworkBlocker
+from os_services.win_dns import WindowsDnsNetworkBlocker
 from os_services.win_network import WindowsHostsNetworkBlocker
 from os_services.win_process import WindowsProcessMonitor
 from ui.main_window import MainWindow
@@ -62,8 +67,15 @@ def main() -> int:
 
     workspace = Path(__file__).resolve().parent
     config_path = workspace / "data" / "config.json"
+    rules_db_path = workspace / "data" / "rules.db"
 
     config_manager = ConfigManager(config_path)
+    rule_store = RuleStore(rules_db_path)
+    rule_store.bootstrap_from_legacy(
+        process_whitelist=config_manager.get_process_whitelist(),
+        network_blacklist=config_manager.get_network_blacklist(),
+    )
+    strategy_runtime = StrategyRuntime(StrategyCompiler(rule_store))
     state_machine = StateMachine()
     timer = PomodoroTimer()
 
@@ -72,16 +84,19 @@ def main() -> int:
     is_admin = is_running_as_admin()
     network_blocker: INetworkBlocker
     if is_admin:
-        network_blocker = WindowsHostsNetworkBlocker()
+        network_blocker = HybridNetworkBlocker(
+            dns_blocker=WindowsDnsNetworkBlocker(),
+            hosts_blocker=WindowsHostsNetworkBlocker(),
+        )
     else:
         network_blocker = NoOpNetworkBlocker()
 
     watchdog = WatchdogService(
         process_monitor=process_monitor,
-        whitelist_provider=config_manager.get_process_whitelist,
+        snapshot_provider=strategy_runtime.get_snapshot,
     )
     scheduler = SchedulerService(
-        config_manager=config_manager,
+        snapshot_provider=strategy_runtime.get_snapshot,
         network_blocker=network_blocker,
     )
 
@@ -92,6 +107,8 @@ def main() -> int:
         watchdog=watchdog,
         scheduler=scheduler,
         process_monitor=process_monitor,
+        rule_store=rule_store,
+        strategy_runtime=strategy_runtime,
         is_admin=is_admin,
     )
     window.show()
